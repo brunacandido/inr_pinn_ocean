@@ -1,0 +1,96 @@
+# PINN / INR config — 4×4° patch centred at 34°S 69°E, southern Indian Ocean
+#
+# Derived from pinn_agulhas.yaml with three patch-specific adjustments:
+#
+#   1. omega_0 reduced from 30 → 20
+#      The domain is 4° wide (~440 km) in smooth open-ocean.  omega_0=30 would
+#      encode sub-mesoscale frequencies (~13 km) that GLORYS 1/12° doesn't have.
+#      omega_0=20 still resolves the mesoscale (Rossby radius ~60 km here) and
+#      the thermocline structure without over-fitting spatial noise.
+#
+#   2. Normalisation bounds tightened to the actual data range
+#      Measured from the downloaded zarr:
+#        thetao: [1.91, 23.96] °C  →  T bounds [1.0, 25.0]
+#        so:     [34.29, 36.02] g/kg →  S bounds [34.0, 36.5]
+#      Using the full Agulhas bounds (T: -2–28, S: 33.5–37) would waste ~25%
+#      of the [-1,1] output range and weaken loss gradients accordingly.
+#      The physics chain-rule rescaling (Δphys / Δnorm) also depends on these
+#      bounds, so wrong bounds shift all physics weights.
+#
+#   3. Domain bounds updated to the patch extent.
+
+model:
+  type: pinn
+  architecture:
+    hidden_dim: 256
+    n_layers: 5
+    omega_0: 20.0          # reduced from 30 — open ocean, smooth horizontal structure
+    out_features: 2        # CT (index 0), SA (index 1)
+
+training:
+  learning_rate: 1.0e-4
+  epochs: 2000
+  batch_size: 8192
+  checkpoint_every: 100
+  seed: 42
+  device: auto
+  scheduler:
+    type: cosine
+    eta_min: 1.0e-6
+  physics_curriculum:
+    warmup_epochs: 200
+    physics_ramp_epochs: 200
+
+data:
+  lon_min: 67.0
+  lon_max: 71.0
+  lat_min: -36.0
+  lat_max: -32.0
+  depth_min: 0.0
+  depth_max: 2500.0
+  n_collocation: 16384
+
+  splits:
+    train: 0.70
+    val:   0.15
+    test:  0.15
+    strategy: spatial
+
+  num_workers: 4
+
+# Bounds measured from the actual downloaded patch (data/glorys_patch_34S69E.zarr).
+# Adding small buffers (0.5–1°C / 0.25 g/kg) so the network is not trained right
+# at the edge of its output range, which would saturate the linear output layer.
+normalisation:
+  lon:   [67.0,  71.0]
+  lat:   [-36.0, -32.0]
+  depth: [0.0,   2500.0]
+  time:  [0,     365]
+  T:     [1.0,   25.0]    # measured range 1.91–23.96 °C  (+buffer)
+  S:     [34.0,  36.5]    # measured range 34.29–36.02 g/kg (+buffer)
+
+# Physics residual weights — same rationale as pinn_agulhas.yaml.
+# This region is open ocean with lower Rossby number than the Agulhas jet,
+# so geostrophic and QG balances are MORE valid here (not less).
+physics_weights:
+  eq1_eos:           0.1
+  eq2_hydrostatic:   1.0
+  eq3_continuity:    0.5
+  eq4_geostrophic:   0.5
+  eq5_thermal_wind:  1.0
+  eq6_qgpv:          0.2   # slightly higher than Agulhas — Ro is lower here
+  eq7_brunt_vaisala: 1.0
+  eq8_ertel_pv:      0.1
+  eq9_salinity_adv:  0.05
+  eq10_temp_adv:     0.05
+  eq11_mixed_layer:  0.1
+
+diffusivity:
+  kappa_T: 1.0e-5
+  kappa_S: 1.0e-5
+
+masking:
+  mld_mask: true
+  ro_threshold: 0.1
+  depth_min_geostrophic: 50.0
+  depth_min_diffusion: null
