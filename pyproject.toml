@@ -1,0 +1,15 @@
+[project]
+name = "inr-pinn-ocean"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "argparse>=1.4.0",
+    "datetime>=6.0",
+    "pandas>=3.0.3",
+    "pathlib>=1.0.1",
+    "typing>=3.10.0.0",
+    "xarray>=2026.4.0",
+    "zarr>=3.2.1",
+]

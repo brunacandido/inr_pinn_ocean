@@ -1,0 +1,56 @@
+# GLORYS12V1 download configuration — 4×4° patch centred at 34°S, 69°E
+#
+# Run:
+#   uv run data/download_glorys.py --config configs/data_config_patch_34S69E.yaml \
+#       --credentials configs/credentials.env
+#
+# Override the year without editing this file:
+#   uv run data/download_glorys.py --config configs/data_config_patch_34S69E.yaml \
+#       --credentials configs/credentials.env \
+#       --start 2021-01-01 --end 2021-12-31
+
+# Human-readable label shown in log output (does not affect the download)
+name: "4×4° patch — 34°S 69°E, southern Indian Ocean"
+
+dataset_id: cmems_mod_glo_phy_my_0.083deg_P1D-m
+
+# Geographic domain: 4×4° box centred on 34°S, 69°E (±2° in each direction).
+# At 0.083° resolution this gives approximately 48 × 48 horizontal grid points.
+domain:
+  lon_min: 67.0      # °E  (69°E − 2°)
+  lon_max: 71.0      # °E  (69°E + 2°)
+  lat_min: -36.0     # °S  (34°S + 2°, negative = south)
+  lat_max: -32.0     # °S  (34°S − 2°)
+  depth_min: 0.0     # m
+  depth_max: 2500.0  # m   surface → UCDW
+
+# Full calendar year 2020 (reanalysis — "my" product is complete)
+time:
+  start: "2020-01-01"
+  end:   "2020-12-31"
+
+# Same variables as the main Agulhas config
+variables:
+  - thetao   # potential temperature (°C)  → CT via TEOS-10
+  - so       # practical salinity (PSU)    → SA via TEOS-10
+  - uo       # eastward velocity (m/s)
+  - vo       # northward velocity (m/s)
+  - zos      # sea-surface height (m)
+  - mlotst   # mixed-layer depth (m)
+
+download:
+  # 3 months per request is fine for this small domain (few hundred MB per chunk)
+  chunk_months: 3
+
+  # The patch is ~48 × 48 points, so lat/lon chunks span the full extent in one
+  # tile — ideal for horizontal maps. Depth and time follow the main config.
+  zarr_chunks:
+    time:      10
+    depth:     25
+    latitude:  50    # covers the full ~48-point extent in one chunk
+    longitude: 50    # idem
+
+  compressor: zstd
+  clevel: 5
+
+  output_dir: data/glorys_patch_34S69E.zarr
