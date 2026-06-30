@@ -178,6 +178,7 @@ class GlorysProfileSplitter:
         seed: int = 42,
         n_val_squares: int = 5,
         weekly_subsample: bool = False,
+        data_fraction: float | None = None,
     ) -> SplitResult:
         """Create a fully reproducible train / val / test / surface split.
 
@@ -213,6 +214,10 @@ class GlorysProfileSplitter:
             (lon, lat) location before splitting.  Reduces the dataset by ~7×
             and is useful for fast experimentation.  The random selection is
             controlled by ``seed``.
+        data_fraction : float | None
+            If set (e.g. 0.1 for 10 %), randomly keep only that fraction of
+            all profiles before splitting.  Applied after ``weekly_subsample``
+            if both are set.  Controlled by ``seed``.
 
         Returns
         -------
@@ -229,31 +234,62 @@ class GlorysProfileSplitter:
         else:
             unique_pids = self._unique_pids
 
+        if data_fraction is not None:
+            if not (0.0 < data_fraction <= 1.0):
+                raise ValueError(f"data_fraction must be in (0, 1], got {data_fraction}")
+            n_keep      = max(1, round(data_fraction * len(unique_pids)))
+            pids_copy   = unique_pids.copy()
+            rng.shuffle(pids_copy)
+            unique_pids = np.sort(pids_copy[:n_keep])
+
         n_total = len(unique_pids)
 
-        # ── Step 1: assign validation profiles ────────────────────────────────
+        # ── Step 1: assign validation (and test) profiles ─────────────────────
         if mode == "uniform":
             val_pids = self._sample_val_uniform(rng, val_fraction, unique_pids)
+
+            # Step 2: training from non-val pool
+            non_val    = unique_pids[~np.isin(unique_pids, val_pids)]
+            rng.shuffle(non_val)
+            n_train    = max(1, round(train_fraction * n_total))
+            train_pids = non_val[:n_train]
+            leftover   = non_val[n_train:]
+
+            # Step 3: surface-only training (optional)
+            if surface_fraction is not None:
+                n_surf    = max(0, round(surface_fraction * n_total))
+                surf_pids = leftover[:n_surf]
+            else:
+                surf_pids = np.array([], dtype=unique_pids.dtype)
+
+            # Step 4: everything not claimed becomes test
+            claimed   = set(val_pids) | set(train_pids) | set(surf_pids)
+            test_pids = unique_pids[~np.isin(unique_pids, list(claimed))]
+
         else:
-            val_pids = self._sample_val_contiguous(rng, val_fraction, n_val_squares, unique_pids)
+            # Contiguous mode: val AND test both come from the same spatial squares.
+            # Squares are sized to cover val + test fraction (= 1 - train_fraction).
+            # Non-touching constraint is enforced between squares.
+            val_pids, all_square_pids = self._sample_val_contiguous(
+                rng, val_fraction, train_fraction, n_val_squares, unique_pids,
+            )
 
-        # ── Step 2: full-depth training from the non-validation pool ──────────
-        non_val = unique_pids[~np.isin(unique_pids, val_pids)]
-        rng.shuffle(non_val)
-        n_train    = max(1, round(train_fraction * n_total))
-        train_pids = non_val[:n_train]
-        leftover   = non_val[n_train:]
+            # Test = square profiles not assigned to val
+            test_pids = all_square_pids[~np.isin(all_square_pids, val_pids)]
 
-        # ── Step 3: surface-only training (optional) ──────────────────────────
-        if surface_fraction is not None:
-            n_surf    = max(0, round(surface_fraction * n_total))
-            surf_pids = leftover[:n_surf]
-        else:
-            surf_pids = np.array([], dtype=unique_pids.dtype)
+            # Training from non-square profiles
+            non_square = unique_pids[~np.isin(unique_pids, all_square_pids)]
+            rng.shuffle(non_square)
+            n_train    = max(1, round(train_fraction * n_total))
+            train_pids = non_square[:n_train]
+            leftover   = non_square[n_train:]
 
-        # ── Step 4: everything not claimed becomes test ────────────────────────
-        claimed   = set(val_pids) | set(train_pids) | set(surf_pids)
-        test_pids = unique_pids[~np.isin(unique_pids, list(claimed))]
+            # Surface-only training (optional, from non-square pool)
+            if surface_fraction is not None:
+                n_surf    = max(0, round(surface_fraction * n_total))
+                surf_pids = leftover[:n_surf]
+            else:
+                surf_pids = np.array([], dtype=unique_pids.dtype)
 
         # ── Step 5: build flat boolean masks over valid observations ───────────
         pid = self._profile_id
@@ -276,6 +312,7 @@ class GlorysProfileSplitter:
             "seed":                   seed,
             "mode":                   mode,
             "weekly_subsample":       weekly_subsample,
+            "data_fraction":          data_fraction,
             "train_fraction":         train_fraction,
             "val_fraction":           val_fraction,
             "surface_fraction":       surface_fraction,
@@ -373,15 +410,17 @@ class GlorysProfileSplitter:
         rng.shuffle(pids)
         return pids[:n_val]
 
-    # Places n_squares spatial boxes so their combined area targets val_fraction
-    # of the domain; all profiles (across all times) inside any box go to val.
+    # Places n_squares non-touching spatial boxes sized to cover val+test fraction.
+    # Returns (val_pids, all_square_pids): val is a random subset of square profiles,
+    # test is the remainder (caller assigns test = all_square_pids \ val_pids).
     def _sample_val_contiguous(
         self,
         rng: np.random.Generator,
         val_fraction: float,
+        train_fraction: float,
         n_squares: int,
         unique_pids: np.ndarray,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         lat_min = float(self._lats_g.min())
         lat_max = float(self._lats_g.max())
         lon_min = float(self._lons_g.min())
@@ -389,30 +428,70 @@ class GlorysProfileSplitter:
         lat_range = lat_max - lat_min
         lon_range = lon_max - lon_min
 
-        # Square half-side (degrees) sized so n_squares boxes cover val_fraction
-        # of the domain area on average (assuming uniform profile density).
-        target_area = val_fraction / n_squares * lat_range * lon_range
+        # Size boxes to cover val + test = (1 - train_fraction) of the domain.
+        held_out_fraction = 1.0 - train_fraction
+        target_area = held_out_fraction / n_squares * lat_range * lon_range
         half_side   = np.sqrt(target_area) / 2.0
 
-        # Clamp so each box always fits inside the domain regardless of size
         half_lat = min(half_side, lat_range / 2.0 * 0.95)
         half_lon = min(half_side, lon_range / 2.0 * 0.95)
+
+        # Minimum gap between box edges: 2 grid cells in each direction.
+        min_gap_lat = float(np.diff(self._lats_g).mean()) * 2 if len(self._lats_g) > 1 else 0.0
+        min_gap_lon = float(np.diff(self._lons_g).mean()) * 2 if len(self._lons_g) > 1 else 0.0
 
         lat_idx, lon_idx = self._pid_to_latlon_idx(unique_pids)
         pid_lats = self._lats_g[lat_idx]
         pid_lons = self._lons_g[lon_idx]
 
-        val_pid_set: set[int] = set()
-        for _ in range(n_squares):
-            c_lat = float(rng.uniform(lat_min + half_lat, lat_max - half_lat))
-            c_lon = float(rng.uniform(lon_min + half_lon, lon_max - half_lon))
+        placed: list[tuple[float, float]] = []   # (c_lat, c_lon) of accepted boxes
+        all_pid_set: set[int] = set()
+
+        for i in range(n_squares):
+            c_lat = c_lon = 0.0
+            accepted = False
+            for _ in range(500):
+                c_lat = float(rng.uniform(lat_min + half_lat, lat_max - half_lat))
+                c_lon = float(rng.uniform(lon_min + half_lon, lon_max - half_lon))
+
+                # A new box is acceptable if it is separated from every placed box
+                # by at least min_gap in lat OR in lon (axis-aligned non-touching).
+                ok = all(
+                    abs(c_lat - p_lat) - 2 * half_lat >= min_gap_lat
+                    or abs(c_lon - p_lon) - 2 * half_lon >= min_gap_lon
+                    for p_lat, p_lon in placed
+                )
+                if ok:
+                    accepted = True
+                    break
+
+            if not accepted:
+                import warnings as _w
+                _w.warn(
+                    f"Could not place non-touching square {i+1}/{n_squares} after 500 "
+                    "attempts — placing at best available position.",
+                    stacklevel=3,
+                )
+
+            placed.append((c_lat, c_lon))
             in_box = (
                 (pid_lats >= c_lat - half_lat) & (pid_lats <= c_lat + half_lat)
                 & (pid_lons >= c_lon - half_lon) & (pid_lons <= c_lon + half_lon)
             )
-            val_pid_set.update(unique_pids[in_box].tolist())
+            all_pid_set.update(unique_pids[in_box].tolist())
 
-        return np.array(sorted(val_pid_set), dtype=unique_pids.dtype)
+        all_square_pids = np.array(sorted(all_pid_set), dtype=unique_pids.dtype)
+
+        # Split square profiles into val and test using val_fraction of total.
+        n_val      = min(
+            max(1, round(val_fraction * len(unique_pids))),
+            len(all_square_pids),
+        )
+        shuffled   = all_square_pids.copy()
+        rng.shuffle(shuffled)
+        val_pids   = np.sort(shuffled[:n_val])
+
+        return val_pids, all_square_pids
 
     # Keeps one randomly selected time step per week per (lon, lat) location.
     def _subsample_weekly(self, rng: np.random.Generator) -> np.ndarray:

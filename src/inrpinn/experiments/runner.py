@@ -139,6 +139,34 @@ def _subsample_depths(
     )
 
 
+# ── Compact result (drop unassigned observations) ─────────────────────────────
+
+def _compact_result(result: SplitResult) -> SplitResult:
+    """Return a SplitResult keeping only observations assigned to at least one split.
+
+    When data_fraction < 1, most observations have all masks False.
+    Compacting before build_arrays reduces flat-array memory by ~1/data_fraction.
+    """
+    used = result.train_mask | result.val_mask | result.test_mask | result.train_surf_mask
+    if used.all():
+        return result
+    return SplitResult(
+        train_mask      = result.train_mask[used],
+        train_surf_mask = result.train_surf_mask[used],
+        val_mask        = result.val_mask[used],
+        test_mask       = result.test_mask[used],
+        profile_id      = result.profile_id[used],
+        i_lon           = result.i_lon[used],
+        i_lat           = result.i_lat[used],
+        i_dep           = result.i_dep[used],
+        i_tim           = result.i_tim[used],
+        lons            = result.lons[used],
+        lats            = result.lats[used],
+        depths          = result.depths[used],
+        info            = result.info,
+    )
+
+
 # ── DataLoader factory ────────────────────────────────────────────────────────
 
 def _make_loader(
@@ -499,6 +527,7 @@ def run_experiment(
     )
     result = splitter.split(**split_kw)
     splitter.print_summary(result)
+    result = _compact_result(result)
 
     print("\nBuilding arrays …", flush=True)
     t0 = time.time()
