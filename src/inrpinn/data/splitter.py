@@ -177,6 +177,7 @@ class GlorysProfileSplitter:
         surface_fraction: float | None = None,
         seed: int = 42,
         n_val_squares: int = 5,
+        weekly_subsample: bool = False,
     ) -> SplitResult:
         """Create a fully reproducible train / val / test / surface split.
 
@@ -207,6 +208,11 @@ class GlorysProfileSplitter:
             even across different experiments.
         n_val_squares : int
             Number of spatial boxes in ``"contiguous"`` mode (default 5).
+        weekly_subsample : bool
+            If True, keep only one randomly selected time step per week per
+            (lon, lat) location before splitting.  Reduces the dataset by ~7×
+            and is useful for fast experimentation.  The random selection is
+            controlled by ``seed``.
 
         Returns
         -------
@@ -216,17 +222,23 @@ class GlorysProfileSplitter:
         """
         self._validate_fractions(train_fraction, val_fraction, surface_fraction)
 
-        rng       = np.random.default_rng(seed)
-        n_total   = len(self._unique_pids)
+        rng = np.random.default_rng(seed)
+
+        if weekly_subsample:
+            unique_pids = self._subsample_weekly(rng)
+        else:
+            unique_pids = self._unique_pids
+
+        n_total = len(unique_pids)
 
         # ── Step 1: assign validation profiles ────────────────────────────────
         if mode == "uniform":
-            val_pids = self._sample_val_uniform(rng, val_fraction)
+            val_pids = self._sample_val_uniform(rng, val_fraction, unique_pids)
         else:
-            val_pids = self._sample_val_contiguous(rng, val_fraction, n_val_squares)
+            val_pids = self._sample_val_contiguous(rng, val_fraction, n_val_squares, unique_pids)
 
         # ── Step 2: full-depth training from the non-validation pool ──────────
-        non_val = self._unique_pids[~np.isin(self._unique_pids, val_pids)]
+        non_val = unique_pids[~np.isin(unique_pids, val_pids)]
         rng.shuffle(non_val)
         n_train    = max(1, round(train_fraction * n_total))
         train_pids = non_val[:n_train]
@@ -237,11 +249,11 @@ class GlorysProfileSplitter:
             n_surf    = max(0, round(surface_fraction * n_total))
             surf_pids = leftover[:n_surf]
         else:
-            surf_pids = np.array([], dtype=self._unique_pids.dtype)
+            surf_pids = np.array([], dtype=unique_pids.dtype)
 
         # ── Step 4: everything not claimed becomes test ────────────────────────
         claimed   = set(val_pids) | set(train_pids) | set(surf_pids)
-        test_pids = self._unique_pids[~np.isin(self._unique_pids, list(claimed))]
+        test_pids = unique_pids[~np.isin(unique_pids, list(claimed))]
 
         # ── Step 5: build flat boolean masks over valid observations ───────────
         pid = self._profile_id
@@ -263,6 +275,7 @@ class GlorysProfileSplitter:
         info = {
             "seed":                   seed,
             "mode":                   mode,
+            "weekly_subsample":       weekly_subsample,
             "train_fraction":         train_fraction,
             "val_fraction":           val_fraction,
             "surface_fraction":       surface_fraction,
@@ -353,10 +366,10 @@ class GlorysProfileSplitter:
 
     # Draws val_fraction of all unique profiles uniformly at random.
     def _sample_val_uniform(
-        self, rng: np.random.Generator, val_fraction: float
+        self, rng: np.random.Generator, val_fraction: float, unique_pids: np.ndarray
     ) -> np.ndarray:
-        n_val = max(1, round(val_fraction * len(self._unique_pids)))
-        pids  = self._unique_pids.copy()
+        n_val = max(1, round(val_fraction * len(unique_pids)))
+        pids  = unique_pids.copy()
         rng.shuffle(pids)
         return pids[:n_val]
 
@@ -367,6 +380,7 @@ class GlorysProfileSplitter:
         rng: np.random.Generator,
         val_fraction: float,
         n_squares: int,
+        unique_pids: np.ndarray,
     ) -> np.ndarray:
         lat_min = float(self._lats_g.min())
         lat_max = float(self._lats_g.max())
@@ -384,7 +398,7 @@ class GlorysProfileSplitter:
         half_lat = min(half_side, lat_range / 2.0 * 0.95)
         half_lon = min(half_side, lon_range / 2.0 * 0.95)
 
-        lat_idx, lon_idx = self._pid_to_latlon_idx(self._unique_pids)
+        lat_idx, lon_idx = self._pid_to_latlon_idx(unique_pids)
         pid_lats = self._lats_g[lat_idx]
         pid_lons = self._lons_g[lon_idx]
 
@@ -396,9 +410,27 @@ class GlorysProfileSplitter:
                 (pid_lats >= c_lat - half_lat) & (pid_lats <= c_lat + half_lat)
                 & (pid_lons >= c_lon - half_lon) & (pid_lons <= c_lon + half_lon)
             )
-            val_pid_set.update(self._unique_pids[in_box].tolist())
+            val_pid_set.update(unique_pids[in_box].tolist())
 
-        return np.array(sorted(val_pid_set), dtype=self._unique_pids.dtype)
+        return np.array(sorted(val_pid_set), dtype=unique_pids.dtype)
+
+    # Keeps one randomly selected time step per week per (lon, lat) location.
+    def _subsample_weekly(self, rng: np.random.Generator) -> np.ndarray:
+        pids    = self._unique_pids
+        n_loc   = self._n_lat * self._n_lon
+        tim_idx = pids // n_loc           # time index for each profile
+        loc_idx = pids % n_loc            # combined (lat, lon) index
+
+        # Week number (0-52 for a 365/366-day year)
+        week_idx = tim_idx // 7
+
+        # Shuffle then take the first occurrence of each (loc, week) pair —
+        # equivalent to choosing one random time step per week per location.
+        order         = rng.permutation(len(pids))
+        pids_s        = pids[order]
+        loc_week_key  = loc_idx[order].astype(np.int64) * 60 + week_idx[order].astype(np.int64)
+        _, first      = np.unique(loc_week_key, return_index=True)
+        return np.sort(pids_s[first])
 
     # Raises ValueError when the requested fractions are geometrically impossible.
     def _validate_fractions(
