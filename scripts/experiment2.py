@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weekly-subsample",  action="store_true", default=False,
                    help="Keep one random time step per week per (lon, lat) location "
                         "(reduces dataset ~7×, useful for fast experiments).")
+    p.add_argument("--data-fraction",     type=float, default=None,
+                   help="Keep only this fraction of profiles (e.g. 0.1 = 10%%).")
+    p.add_argument("--depth-fraction",    type=float, default=None,
+                   help="Keep all surface obs + this fraction of deeper depth obs "
+                        "(e.g. 0.2 = 20%% of non-surface levels).")
 
     p.add_argument("--epochs",           type=int,   default=2000)
     p.add_argument("--batch-size",       type=int,   default=8192)
@@ -61,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-every", type=int,   default=50)
     p.add_argument("--infer-batch",      type=int,   default=32768)
     p.add_argument("--device",           type=str,   default=None)
+    p.add_argument("--resume",           type=Path,  default=None,
+                   help="Path to a checkpoint to resume training from.")
     p.add_argument("--num-workers",      type=int,   default=8,
                    help="DataLoader worker processes (0 = main process only).")
     p.add_argument("--amp",              action=argparse.BooleanOptionalAction, default=True,
