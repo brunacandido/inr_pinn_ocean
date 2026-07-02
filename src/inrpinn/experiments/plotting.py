@@ -53,7 +53,7 @@ def _save_fig(fig: plt.Figure, plots_dir: Path, name: str) -> Path:
 
 
 def _draw_surface_field(ax, lons, lats, data, label, cmap, title):
-    im = ax.pcolormesh(lons, lats, data, cmap=cmap, shading="auto")
+    im = ax.pcolormesh(lons, lats, data, cmap=cmap, shading="auto", rasterized=True)
     plt.colorbar(im, ax=ax, label=label, pad=0.02, fraction=0.046)
     ax.set_xlabel("Longitude (°E)")
     ax.set_ylabel("Latitude (°N)")
@@ -82,7 +82,7 @@ def _draw_profile(ax, prof, depths, label, color):
 
 def _draw_depth_counts(ax, i_dep, depths):
     counts = np.bincount(i_dep, minlength=len(depths))
-    ax.barh(depths, counts / 1e3, color="steelblue", alpha=0.75)
+    ax.barh(depths, counts / 1e3, color="steelblue", alpha=0.75, rasterized=True)
     ax.invert_yaxis()
     ax.set_xlabel("Obs (×10³)")
     ax.set_ylabel("Depth (m)")
@@ -91,7 +91,7 @@ def _draw_depth_counts(ax, i_dep, depths):
 
 def _draw_split_frac(ax, lons, lats, frac_map, title, cmap):
     im = ax.pcolormesh(lons, lats, frac_map.T, cmap=cmap,
-                       vmin=0, vmax=1, shading="auto")
+                       vmin=0, vmax=1, shading="auto", rasterized=True)
     plt.colorbar(im, ax=ax, label="Fraction", pad=0.02, fraction=0.046)
     ax.set_title(title)
     ax.set_xlabel("Lon (°E)")
@@ -116,7 +116,7 @@ def _draw_lr_curve(ax, epochs, lr_vals):
 
 
 def _draw_scatter(ax, pred, true, label, unit, rmse, mae, color, rng):
-    n   = min(50_000, len(pred))
+    n   = min(20_000, len(pred))
     idx = rng.choice(len(pred), n, replace=False)
     ax.scatter(true[idx], pred[idx], s=2, alpha=0.25, color=color,
                edgecolors="none", rasterized=True)
@@ -152,70 +152,99 @@ def pdf_cover(
     test_metrics: dict,
 ) -> plt.Figure:
     arch = cfg["model"]["architecture"]
+    info = result.info
 
     fig = plt.figure(figsize=A4_P, facecolor="#1a1a2e")
 
-    def _t(x, y, s, **kw):
-        fig.text(x, y, s, transform=fig.transFigure, ha="center", **kw)
+    def _ft(x, y, s, **kw):
+        return fig.text(x, y, s, transform=fig.transFigure, **kw)
 
-    _t(0.5, 0.92, exp_name,      fontsize=30, color="white", fontweight="bold")
-    _t(0.5, 0.87, f"INR Baseline — Dense Training · {val_mode_label}",
-       fontsize=13, color="#a0c4ff")
-    _t(0.5, 0.84, "SIREN backbone · data loss only · no physics",
-       fontsize=10, color="#8899bb")
+    # ── Title ──────────────────────────────────────────────────────────────────
+    _ft(0.5, 0.945, exp_name, fontsize=28, color="white", fontweight="bold", ha="center")
+    _ft(0.5, 0.902, f"INR Baseline — Dense Training · {val_mode_label}",
+        fontsize=12, color="#a0c4ff", ha="center")
+    _ft(0.5, 0.874, "SIREN backbone · data loss only · no physics",
+        fontsize=9, color="#8899bb", ha="center")
 
-    line_kw = dict(transform=fig.transFigure, color="#334466", lw=0.8)
-    fig.add_artist(plt.Line2D([0.08, 0.92], [0.82, 0.82], **line_kw))
+    lkw = dict(transform=fig.transFigure, color="#4a6080", lw=0.8)
+    fig.add_artist(plt.Line2D([0.05, 0.95], [0.856, 0.856], **lkw))
 
-    ax = fig.add_axes([0.08, 0.32, 0.84, 0.48])
-    ax.axis("off")
+    # ── Two separate axes — left and right columns clip independently ───────────
+    # Left: Model + Data Split      Right: Training + Results
+    # Using separate axes prevents any text from the left column bleeding into
+    # the right column, regardless of value string length.
 
-    left_lines = [
-        ("Model",      f"SIREN  {arch['hidden_dim']} × {arch['n_layers']} layers"),
-        ("ω₀",         f"{arch['omega_0']}"),
-        ("Parameters", f"{n_params:,}"),
-        ("", ""),
-        ("Val mode",   result.info["mode"]),
-        ("Train",      f"{result.info['actual_train_fraction']:.1%}  "
-                       f"({result.info['n_train_profiles']:,} profiles)"),
-        ("Validation", f"{result.info['actual_val_fraction']:.1%}  "
-                       f"({result.info['n_val_profiles']:,} profiles)"),
-        ("Test",       f"{result.info['actual_test_fraction']:.1%}  "
-                       f"({result.info['n_test_profiles']:,} profiles)"),
-        ("Seed",       str(args.seed)),
+    def _draw_col(ax, rows: list[tuple[str, str | None]]) -> None:
+        """Draw a list of (key, value|None) rows into an axis."""
+        n  = len(rows)
+        dh = 1.0 / n
+        for i, (key, val) in enumerate(rows):
+            y = 1.0 - (i + 0.5) * dh
+            if val is None:
+                ax.text(0.01, y, key, fontsize=8.5, color="#a0c4ff",
+                        fontweight="bold", va="center", ha="left",
+                        transform=ax.transAxes)
+                # thin rule below section header
+                ax.axhline(y=1.0 - (i + 1) * dh, color="#2d4060",
+                           lw=0.6, xmin=0, xmax=1)
+            else:
+                ax.text(0.02, y, key, fontsize=9, color="#aabbdd",
+                        va="center", ha="left", transform=ax.transAxes,
+                        clip_on=True)
+                ax.text(0.48, y, val, fontsize=9, color="white",
+                        fontweight="bold", va="center", ha="left",
+                        transform=ax.transAxes, clip_on=True)
+
+    left_rows: list[tuple[str, str | None]] = [
+        ("── MODEL", None),
+        ("Architecture",  f"SIREN  {arch['hidden_dim']} × {arch['n_layers']} layers"),
+        ("ω₀",            str(arch["omega_0"])),
+        ("Parameters",    f"{n_params:,}"),
+        ("── DATA SPLIT", None),
+        ("Mode",          info["mode"]),
+        ("Train",
+         f"{info['actual_train_fraction']:.1%}  ·  {info['n_train_profiles']:,} profiles"),
+        ("   obs",        f"{info['n_train_obs']:,}"),
+        ("Validation",
+         f"{info['actual_val_fraction']:.1%}  ·  {info['n_val_profiles']:,} profiles"),
+        ("   obs",        f"{info['n_val_obs']:,}"),
+        ("Test",
+         f"{info['actual_test_fraction']:.1%}  ·  {info['n_test_profiles']:,} profiles"),
+        ("   obs",        f"{info['n_test_obs']:,}"),
+        ("Seed",          str(args.seed)),
     ]
-    right_lines = [
-        ("Learning rate", f"{args.lr or cfg['training']['learning_rate']:.1e}"),
+    right_rows: list[tuple[str, str | None]] = [
+        ("── TRAINING", None),
+        ("Learning rate", f"{args.lr or cfg['training']['learning_rate']:.2e}"),
         ("Batch size",    f"{args.batch_size:,}"),
         ("Max epochs",    f"{args.epochs:,}"),
-        ("Patience",      f"{args.patience}"),
-        ("", ""),
-        ("Best epoch",    f"{history['best_epoch']}"),
+        ("Patience",      str(args.patience)),
+        ("Best epoch",    str(history["best_epoch"])),
         ("Best val loss", f"{history['best_val_loss']:.6f}"),
-        ("", ""),
+        ("── RESULTS", None),
         ("Val  T RMSE",   f"{val_metrics['T_rmse']:.4f} °C"),
         ("Val  S RMSE",   f"{val_metrics['S_rmse']:.5f} PSU"),
         ("Test T RMSE",   f"{test_metrics['T_rmse']:.4f} °C"),
         ("Test S RMSE",   f"{test_metrics['S_rmse']:.5f} PSU"),
     ]
 
-    y0, dy = 0.96, 0.085
-    for i, (key, val) in enumerate(left_lines):
-        y = y0 - i * dy
-        ax.text(0.03, y, key, fontsize=9.5, color="#aabbdd", va="top")
-        ax.text(0.30, y, val, fontsize=9.5, color="white",   va="top", fontweight="bold")
+    ax_l = fig.add_axes([0.05, 0.10, 0.435, 0.745])
+    ax_l.set_facecolor("none"); ax_l.axis("off")
+    _draw_col(ax_l, left_rows)
 
-    for i, (key, val) in enumerate(right_lines):
-        y = y0 - i * dy
-        ax.text(0.55, y, key, fontsize=9.5, color="#aabbdd", va="top")
-        ax.text(0.78, y, val, fontsize=9.5, color="white",   va="top", fontweight="bold")
+    ax_r = fig.add_axes([0.515, 0.10, 0.435, 0.745])
+    ax_r.set_facecolor("none"); ax_r.axis("off")
+    _draw_col(ax_r, right_rows)
 
-    fig.add_artist(plt.Line2D([0.08, 0.92], [0.30, 0.30], **line_kw))
-    _t(0.5, 0.26, f"Config: {args.config.name}   ·   Zarr: {args.zarr_path.name}",
-       fontsize=8, color="#667799")
-    _t(0.5, 0.22, datetime.now().strftime("%Y-%m-%d %H:%M"),
-       fontsize=8, color="#667799")
+    # Vertical divider between columns
+    fig.add_artist(plt.Line2D([0.505, 0.505], [0.10, 0.856],
+                               transform=fig.transFigure, color="#334466", lw=0.6))
 
+    fig.add_artist(plt.Line2D([0.05, 0.95], [0.09, 0.09], **lkw))
+    _ft(0.5, 0.04,
+        f"Config: {args.config.name}   ·   {args.zarr_path.name}   ·   "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        ha="center", fontsize=8, color="#667799")
     return fig
 
 
@@ -223,18 +252,21 @@ def pdf_spatial_fields(
     ds, var_temp: str, var_sal: str,
     label_T: str, label_S: str,
 ) -> plt.Figure:
-    lons    = ds.longitude.values
-    lats    = ds.latitude.values
-    T_surf  = ds[var_temp].isel(depth=0).mean(dim="time").values
-    S_surf  = ds[var_sal].isel(depth=0).mean(dim="time").values
+    lons   = ds.longitude.values
+    lats   = ds.latitude.values
+    T_surf = ds[var_temp].isel(depth=0).mean(dim="time").values
+    S_surf = ds[var_sal].isel(depth=0).mean(dim="time").values
 
-    fig, axes = plt.subplots(1, 2, figsize=A4_L)
-    fig.suptitle("Mean Annual Sea Surface Fields", fontsize=13, fontweight="bold", y=0.98)
+    fig, axes = plt.subplots(2, 1, figsize=A4_P)
+    fig.suptitle("Mean Annual Sea Surface Fields", fontsize=13, fontweight="bold")
 
     _draw_surface_field(axes[0], lons, lats, T_surf, label_T, CMAP_T, f"Surface {label_T}")
     _draw_surface_field(axes[1], lons, lats, S_surf, label_S, CMAP_S, f"Surface {label_S}")
+    for ax in axes:
+        ax.set_aspect("equal", adjustable="box")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    # subplots_adjust (not tight_layout) so the equal-aspect constraint is never overridden
+    fig.subplots_adjust(top=0.93, bottom=0.06, left=0.13, right=0.87, hspace=0.40)
     return fig
 
 
@@ -275,10 +307,10 @@ def pdf_temporal_profiles(
 
 
 def pdf_split_map(result: SplitResult, ds) -> plt.Figure:
-    lons_g  = ds.longitude.values
-    lats_g  = ds.latitude.values
-    n_lon   = len(lons_g)
-    n_lat   = len(lats_g)
+    lons_g = ds.longitude.values
+    lats_g = ds.latitude.values
+    n_lon  = len(lons_g)
+    n_lat  = len(lats_g)
 
     cell_id = (result.i_lat * n_lon + result.i_lon).astype(np.int64)
     tot     = np.maximum(
@@ -291,25 +323,31 @@ def pdf_split_map(result: SplitResult, ds) -> plt.Figure:
         )
 
     info = result.info
-    fig, axes = plt.subplots(1, 3, figsize=A4_L)
+    fig, axes = plt.subplots(3, 1, figsize=A4_P)
     fig.suptitle(
         f"Profile Split — {info['mode']} mode  ·  seed={info['seed']}  ·  "
         f"train {info['actual_train_fraction']:.0%}  "
         f"val {info['actual_val_fraction']:.0%}  "
         f"test {info['actual_test_fraction']:.0%}",
-        fontsize=11, fontweight="bold", y=0.99,
+        fontsize=11, fontweight="bold",
     )
 
     _draw_split_frac(axes[0], lons_g, lats_g, _frac(result.train_mask), "Train",      "Blues")
     _draw_split_frac(axes[1], lons_g, lats_g, _frac(result.val_mask),   "Validation", "Oranges")
     _draw_split_frac(axes[2], lons_g, lats_g, _frac(result.test_mask),  "Test",       "Greens")
 
-    for ax in axes[1:]:
-        ax.set_ylabel("")
-        ax.tick_params(labelleft=False)
+    for ax in axes:
+        ax.set_aspect("equal", adjustable="box")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    # subplots_adjust (not tight_layout) so the equal-aspect constraint is never overridden
+    fig.subplots_adjust(top=0.93, bottom=0.04, left=0.13, right=0.87, hspace=0.40)
     return fig
+
+
+def save_split_map_png(result: SplitResult, ds, plots_dir: Path) -> Path:
+    """Save the split distribution map as a PNG immediately after splitting."""
+    fig = pdf_split_map(result, ds)
+    return _save_fig(fig, plots_dir, "split_map")
 
 
 def pdf_training(history: dict) -> plt.Figure:
@@ -546,7 +584,7 @@ def build_pdf(pages: list[plt.Figure], output_dir: Path, title: str) -> Path:
     pdf_path = output_dir / "report.pdf"
     with PdfPages(pdf_path) as pdf:
         for fig in pages:
-            pdf.savefig(fig, bbox_inches="tight")
+            pdf.savefig(fig, bbox_inches="tight", dpi=96)
             plt.close(fig)
         pdf.infodict()["Title"]   = title
         pdf.infodict()["Subject"] = "Ocean INR reconstruction — GLORYS12V1"

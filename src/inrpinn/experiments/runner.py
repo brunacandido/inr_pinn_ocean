@@ -9,6 +9,8 @@ PDF and PNG plotting lives in plotting.py.
 from __future__ import annotations
 
 import json
+import re
+import sys
 import time
 import warnings
 from datetime import datetime
@@ -27,7 +29,7 @@ from inrpinn.data.dataset import denorm_minmax, norm_minmax
 from inrpinn.data.splitter import GlorysProfileSplitter, SplitResult
 from inrpinn.models.inr import INR
 from inrpinn.experiments.plotting import (
-    build_pdf, save_individual_pngs,
+    build_pdf, save_individual_pngs, save_split_map_png,
     pdf_cover, pdf_spatial_fields, pdf_temporal_profiles,
     pdf_split_map, pdf_training, pdf_evaluation, pdf_summary,
 )
@@ -167,7 +169,59 @@ def _compact_result(result: SplitResult) -> SplitResult:
     )
 
 
-# ── DataLoader factory ────────────────────────────────────────────────────────
+# ── Fast in-memory loader ─────────────────────────────────────────────────────
+
+class _FastLoader:
+    """Drop-in DataLoader replacement for in-memory numpy arrays.
+
+    Keeps both arrays on GPU if they fit; otherwise falls back to CPU pinned
+    memory with non-blocking transfer.  Eliminates multiprocessing overhead
+    entirely — the main bottleneck when data already lives in RAM.
+    """
+
+    def __init__(
+        self,
+        coords_np: np.ndarray,
+        targets_np: np.ndarray,
+        batch_size: int,
+        shuffle: bool,
+        device: torch.device,
+    ) -> None:
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
+        self.device     = device
+        n               = len(coords_np)
+        self._n         = n
+
+        coords_t  = torch.from_numpy(coords_np)
+        targets_t = torch.from_numpy(targets_np)
+
+        # Try GPU first (~6 floats × n × 4 bytes total)
+        try:
+            self._coords  = coords_t.to(device)
+            self._targets = targets_t.to(device)
+            self._on_gpu  = True
+        except RuntimeError:
+            # OOM — fall back to pinned CPU memory for fast non-blocking transfer
+            self._coords  = coords_t.pin_memory()
+            self._targets = targets_t.pin_memory()
+            self._on_gpu  = False
+
+    def __len__(self) -> int:
+        return (self._n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        dev = self.device if self._on_gpu else torch.device("cpu")
+        idx = (torch.randperm(self._n, device=dev)
+               if self.shuffle else torch.arange(self._n, device=dev))
+        for i in range(0, self._n, self.batch_size):
+            bi = idx[i : i + self.batch_size]
+            if self._on_gpu:
+                yield self._coords[bi], self._targets[bi]
+            else:
+                yield (self._coords[bi].to(self.device, non_blocking=True),
+                       self._targets[bi].to(self.device, non_blocking=True))
+
 
 def _make_loader(
     *arrays: np.ndarray,
@@ -176,6 +230,7 @@ def _make_loader(
     num_workers: int,
     pin_memory: bool,
 ) -> DataLoader:
+    """Legacy DataLoader — kept for infer_split which uses variable-size slices."""
     tensors = [torch.from_numpy(a) for a in arrays]
     kw: dict = dict(
         batch_size=batch_size,
@@ -203,21 +258,20 @@ def train(
     device: torch.device,
     resume_from: Path | None = None,
 ) -> tuple[dict, dict, int]:
-    lr          = args.lr or cfg["training"]["learning_rate"]
-    use_amp     = getattr(args, "amp", False) and device.type == "cuda"
-    num_workers = getattr(args, "num_workers", 0)
-    pin_memory  = device.type == "cuda"
+    lr      = args.lr or cfg["training"]["learning_rate"]
+    use_amp = getattr(args, "amp", False) and device.type == "cuda"
 
-    train_loader = _make_loader(
+    print("  Loading data into memory …", flush=True)
+    train_loader = _FastLoader(
         train_coords_np, train_targets_np,
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
+        batch_size=args.batch_size, shuffle=True, device=device,
     )
-    val_loader = _make_loader(
+    val_loader = _FastLoader(
         val_coords_np, val_targets_np,
-        batch_size=args.infer_batch, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory,
+        batch_size=args.infer_batch, shuffle=False, device=device,
     )
+    _loc = "GPU" if train_loader._on_gpu else "CPU (pinned)"
+    print(f"  Training data on {_loc}  |  {len(train_loader)} batches/epoch")
 
     optimiser = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -319,7 +373,7 @@ def train(
 
         if patience_ctr >= args.patience:
             stopped = epoch
-            pbar.write(f"[epoch {epoch}] Early stop — best val={best_val:.6f} @ epoch {best_epoch}")
+            print(f"\n[epoch {epoch}] Early stop — best val={best_val:.6f} @ epoch {best_epoch}", flush=True)
             break
 
         if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
@@ -347,6 +401,99 @@ def train(
     history["best_val_loss"] = best_val
     history["stopped_epoch"] = stopped
     return history, best_state, best_epoch
+
+
+# ── Line profiler ─────────────────────────────────────────────────────────────
+
+def run_profiling(
+    model: INR,
+    train_coords_np: np.ndarray,
+    train_targets_np: np.ndarray,
+    val_coords_np: np.ndarray,
+    val_targets_np: np.ndarray,
+    args,
+    cfg: dict,
+    ckpt_dir: Path,
+    output_dir: Path,
+    device: torch.device,
+    n_epochs: int,
+    sync: bool = False,
+) -> None:
+    """Profile n_epochs of training with line_profiler and save profile.txt.
+
+    sync=True inserts torch.cuda.synchronize() after each CUDA launch so that
+    timings reflect actual GPU execution time rather than kernel launch time.
+    This makes profiled code run slower than normal but gives accurate numbers.
+    """
+    try:
+        from line_profiler import LineProfiler
+    except ImportError:
+        print("line_profiler not installed — run: uv add --optional dev line-profiler")
+        return
+
+    import copy, io
+
+    prof_args = copy.copy(args)
+    prof_args.epochs          = n_epochs
+    prof_args.checkpoint_every = 0           # no checkpoint I/O during profiling
+    prof_args.patience        = n_epochs + 1 # disable early stopping
+    prof_args.val_every       = n_epochs     # validate only on the last epoch
+
+    if sync and device.type == "cuda":
+        # Patch the training loop to synchronize after every CUDA op so that
+        # line_profiler sees GPU wall-clock time, not just kernel launch time.
+        _orig_train = train
+
+        def _synced_train(*a, **kw):
+            import torch as _torch
+            _real_step   = torch.optim.Adam.step
+            _real_update = torch.amp.GradScaler.update
+
+            def _step(self, *sa, **sk):
+                r = _real_step(self, *sa, **sk)
+                _torch.cuda.synchronize()
+                return r
+
+            def _update(self, *ua, **uk):
+                r = _real_update(self, *ua, **uk)
+                _torch.cuda.synchronize()
+                return r
+
+            torch.optim.Adam.step       = _step
+            torch.amp.GradScaler.update = _update
+            try:
+                return _orig_train(*a, **kw)
+            finally:
+                torch.optim.Adam.step       = _real_step
+                torch.amp.GradScaler.update = _real_update
+
+        target = _synced_train
+    else:
+        target = train
+
+    lp = LineProfiler()
+    lp.add_function(train)
+    for attr in ("forward", "loss"):
+        fn = getattr(type(model), attr, None)
+        if fn is not None:
+            lp.add_function(fn)
+
+    print(f"\nProfiling {n_epochs} epoch(s)  [sync={sync}] …")
+    lp(target)(
+        model,
+        train_coords_np, train_targets_np,
+        val_coords_np,   val_targets_np,
+        prof_args, cfg, ckpt_dir, device,
+    )
+
+    stream = io.StringIO()
+    lp.print_stats(stream=stream, output_unit=1e-3, stripzeros=True)
+    text = stream.getvalue()
+    print(text)
+
+    out = output_dir / "profile.txt"
+    out.write_text(text, encoding="utf-8")
+    print(f"Profile → {out}")
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -476,6 +623,144 @@ def save_results(
     return out
 
 
+# ── Log tee ───────────────────────────────────────────────────────────────────
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+class _Tee:
+    """Mirror sys.stdout to both the terminal and a log file (ANSI-stripped)."""
+    def __init__(self, original, logfile):
+        self._orig = original
+        self._log  = logfile
+
+    def write(self, data: str) -> int:
+        self._orig.write(data)
+        self._log.write(_ANSI_RE.sub("", data))
+        self._log.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        self._orig.flush()
+        self._log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+# ── Run-info file ─────────────────────────────────────────────────────────────
+
+def _save_run_info(
+    exp_name: str,
+    val_mode: str,
+    args,
+    output_dir: Path,
+    extra_split_kwargs: dict | None = None,
+) -> Path:
+    """Write run_info.txt with the full config and resume command."""
+    script = {
+        "uniform":          "scripts/experiment1.py",
+        "contiguous":       "scripts/experiment2.py",
+        "disjoint_squares": "scripts/experiment2b.py",
+    }.get(val_mode, "scripts/experiment.py")
+
+    W = 22  # key column width for alignment
+
+    def _sec(title: str) -> list[str]:
+        return ["", title, "─" * 52]
+
+    cfg_rows = [
+        ("Zarr path",        str(args.zarr_path)),
+        ("Zarr group",       getattr(args, "zarr_group", "raw")),
+        ("Config file",      str(args.config)),
+        ("Val mode",         val_mode + (
+            f" ({extra_split_kwargs['n_val_squares']} val"
+            + (f" + {extra_split_kwargs['n_test_squares']} test"
+               if extra_split_kwargs and "n_test_squares" in extra_split_kwargs else "")
+            + " squares)"
+            if extra_split_kwargs and "n_val_squares" in extra_split_kwargs else ""
+        )),
+        ("Train fraction",   f"{args.train_fraction}"),
+        ("Val fraction",     f"{args.val_fraction}"),
+        ("Seed",             str(args.seed)),
+        ("Data fraction",    str(args.data_fraction)
+                             if getattr(args, "data_fraction", None) is not None else "—"),
+        ("Depth fraction",   str(args.depth_fraction)
+                             if getattr(args, "depth_fraction", None) is not None else "—"),
+        ("Weekly subsample", str(getattr(args, "weekly_subsample", False))),
+        ("Epochs",           f"{args.epochs:,}"),
+        ("Batch size",       f"{args.batch_size:,}"),
+        ("Infer batch",      f"{args.infer_batch:,}"),
+        ("Learning rate",    f"{args.lr:.2e}" if getattr(args, "lr", None) else "(from config)"),
+        ("Patience",         str(args.patience)),
+        ("Min delta",        str(args.min_delta)),
+        ("Val every",        str(getattr(args, "val_every", 1))),
+        ("Checkpoint every", str(args.checkpoint_every)),
+        ("Num workers",      str(getattr(args, "num_workers", 0))),
+        ("AMP",              str(getattr(args, "amp", False))),
+        ("Device",           getattr(args, "device", None) or "(auto)"),
+    ]
+
+    lines: list[str] = [
+        exp_name,
+        "=" * len(exp_name),
+        f"Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Output  : {output_dir}",
+    ]
+    lines += _sec("Configuration")
+    for k, v in cfg_rows:
+        lines.append(f"  {k:<{W}}{v}")
+
+    # ── Resume command ─────────────────────────────────────────────────────────
+    def _f(flag: str, val) -> str:
+        return f"    --{flag} {val}"
+
+    parts = [f"uv run {script}"]
+    parts += [
+        _f("zarr-path",      args.zarr_path),
+        _f("zarr-group",     getattr(args, "zarr_group", "raw")),
+        _f("config",         args.config),
+        _f("output-dir",     args.output_dir),
+        _f("train-fraction", args.train_fraction),
+        _f("val-fraction",   args.val_fraction),
+    ]
+    if extra_split_kwargs and "n_val_squares" in extra_split_kwargs:
+        parts.append(_f("n-val-squares", extra_split_kwargs["n_val_squares"]))
+    if extra_split_kwargs and "n_test_squares" in extra_split_kwargs:
+        parts.append(_f("n-test-squares", extra_split_kwargs["n_test_squares"]))
+    parts.append(_f("seed", args.seed))
+    if getattr(args, "data_fraction", None) is not None:
+        parts.append(_f("data-fraction", args.data_fraction))
+    if getattr(args, "depth_fraction", None) is not None:
+        parts.append(_f("depth-fraction", args.depth_fraction))
+    if getattr(args, "weekly_subsample", False):
+        parts.append("    --weekly-subsample")
+    parts += [
+        _f("epochs",           args.epochs),
+        _f("batch-size",       args.batch_size),
+        _f("infer-batch",      args.infer_batch),
+        _f("patience",         args.patience),
+        _f("min-delta",        args.min_delta),
+        _f("checkpoint-every", args.checkpoint_every),
+        _f("num-workers",      getattr(args, "num_workers", 0)),
+        _f("val-every",        getattr(args, "val_every", 1)),
+    ]
+    parts.append("    --amp" if getattr(args, "amp", False) else "    --no-amp")
+    if getattr(args, "lr", None):
+        parts.append(_f("lr", args.lr))
+    if getattr(args, "device", None):
+        parts.append(_f("device", args.device))
+    parts.append(f"    --resume {output_dir}/checkpoints/epoch_XXXX.pt")
+
+    lines += _sec("Resume command")
+    lines.append(" \\\n".join(parts))
+    lines.append("")
+
+    out = output_dir / "run_info.txt"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
 # ── Shared main pipeline ──────────────────────────────────────────────────────
 
 def run_experiment(
@@ -499,6 +784,15 @@ def run_experiment(
     ckpt_dir   = output_dir / "checkpoints"
     for d in (output_dir, plots_dir, ckpt_dir):
         d.mkdir(parents=True, exist_ok=True)
+
+    _save_run_info(exp_name, val_mode, args, output_dir, extra_split_kwargs)
+
+    log_path     = output_dir / "train.log"
+    _log_file    = open(log_path, "w", buffering=1, encoding="utf-8")
+    _orig_stdout = sys.stdout
+    _orig_stderr = sys.stderr
+    sys.stdout   = _Tee(_orig_stdout, _log_file)
+    sys.stderr   = _Tee(_orig_stderr, _log_file)
 
     print("─" * 60)
     print(f"{exp_name} — INR  |  {val_mode} split")
@@ -528,6 +822,10 @@ def run_experiment(
     result = splitter.split(**split_kw)
     splitter.print_summary(result)
     result = _compact_result(result)
+
+    print("Saving split map …", flush=True)
+    split_png = save_split_map_png(result, ds, plots_dir)
+    print(f"  Split map → {split_png}")
 
     print("\nBuilding arrays …", flush=True)
     t0 = time.time()
@@ -559,6 +857,20 @@ def run_experiment(
         print(f"\nModel: {model}  |  params: {n_params:,}")
 
     print(f"  AMP={use_amp}  workers={num_workers}")
+
+    profile_epochs = getattr(args, "profile_epochs", 0)
+    if profile_epochs:
+        run_profiling(
+            model,
+            coords_np[result.train_mask], targets_np[result.train_mask],
+            coords_np[result.val_mask],   targets_np[result.val_mask],
+            args, cfg, ckpt_dir, output_dir, device,
+            n_epochs=profile_epochs,
+            sync=getattr(args, "profile_sync", False),
+        )
+        sys.stdout = _orig_stdout
+        _log_file.close()
+        return
 
     print("\nStarting training …")
     t0 = time.time()
@@ -637,3 +949,8 @@ def run_experiment(
     print(f"  Best epoch  : {best_epoch}")
     print(f"  Training    : {elapsed/60:.1f} min")
     print("─" * 60)
+
+    sys.stdout = _orig_stdout
+    sys.stderr = _orig_stderr
+    _log_file.close()
+    print(f"Log → {log_path}")
