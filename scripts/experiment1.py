@@ -49,11 +49,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weekly-subsample",  action="store_true", default=False,
                    help="Keep one random time step per week per (lon, lat) location "
                         "(reduces dataset ~7×, useful for fast experiments).")
-    p.add_argument("--data-fraction",     type=float, default=None,
-                   help="Keep only this fraction of profiles (e.g. 0.1 = 10%%).")
-    p.add_argument("--depth-fraction",    type=float, default=None,
-                   help="Keep all surface obs + this fraction of deeper depth obs "
-                        "(e.g. 0.2 = 20%% of non-surface levels).")
+    p.add_argument("--train-depths-data-fraction",     type=float, default=None,
+                   help="Fraction of non-surface TRAINING observations to keep "
+                        "(surface training obs and all val/test obs are always kept).")
 
     p.add_argument("--epochs",           type=int,   default=2000)
     p.add_argument("--batch-size",       type=int,   default=8192)

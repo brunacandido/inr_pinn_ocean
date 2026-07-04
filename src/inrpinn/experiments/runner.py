@@ -18,6 +18,13 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
+try:
+    import mlflow
+    import mlflow.pytorch
+    _MLFLOW = True
+except ImportError:
+    _MLFLOW = False
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -99,49 +106,47 @@ def build_arrays(
 
 # ── Depth subsampling ─────────────────────────────────────────────────────────
 
-def _subsample_depths(
+def _subsample_train_depths(
     result: SplitResult,
-    coords_np: np.ndarray,
-    targets_np: np.ndarray,
-    targets_phys: np.ndarray,
-    depth_fraction: float,
+    data_fraction: float,
     seed: int,
-) -> tuple[SplitResult, np.ndarray, np.ndarray, np.ndarray]:
-    """Keep all surface (depth index 0) observations and a random fraction of deeper ones."""
-    is_surface = result.i_dep == 0
-    deep_idx   = np.where(~is_surface)[0]
+) -> SplitResult:
+    """Keep ALL surface training obs + a random fraction of non-surface training obs.
+
+    Val and test masks are completely untouched — evaluation data is never reduced.
+    """
+    is_surface     = result.i_dep == 0
+    deep_train_idx = np.where(result.train_mask & ~is_surface)[0]
 
     rng    = np.random.default_rng(seed + 9999)
-    n_keep = max(1, round(depth_fraction * len(deep_idx)))
-    chosen = rng.choice(deep_idx, n_keep, replace=False)
+    n_keep = max(1, round(data_fraction * len(deep_train_idx)))
+    chosen = np.sort(rng.choice(deep_train_idx, n_keep, replace=False))
 
-    keep          = is_surface.copy()
-    keep[chosen]  = True
+    new_train                 = result.train_mask.copy()
+    new_train[deep_train_idx] = False  # drop all non-surface training obs
+    new_train[chosen]         = True   # restore the randomly kept fraction
 
-    new_result = SplitResult(
-        train_mask      = result.train_mask[keep],
-        train_surf_mask = result.train_surf_mask[keep],
-        val_mask        = result.val_mask[keep],
-        test_mask       = result.test_mask[keep],
-        profile_id      = result.profile_id[keep],
-        i_lon           = result.i_lon[keep],
-        i_lat           = result.i_lat[keep],
-        i_dep           = result.i_dep[keep],
-        i_tim           = result.i_tim[keep],
-        lons            = result.lons[keep],
-        lats            = result.lats[keep],
-        depths          = result.depths[keep],
-        info            = {**result.info, "depth_fraction": depth_fraction},
+    n_surf = int((new_train & is_surface).sum())
+    n_deep = int((new_train & ~is_surface).sum())
+    print(f"  Training depth subsample ({data_fraction:.0%}): "
+          f"{n_surf:,} surface (all kept) + {n_deep:,} deep = {n_surf + n_deep:,} total")
+
+    return SplitResult(
+        train_mask      = new_train,
+        train_surf_mask = result.train_surf_mask,
+        val_mask        = result.val_mask,
+        test_mask       = result.test_mask,
+        profile_id      = result.profile_id,
+        i_lon           = result.i_lon,
+        i_lat           = result.i_lat,
+        i_dep           = result.i_dep,
+        i_tim           = result.i_tim,
+        lons            = result.lons,
+        lats            = result.lats,
+        depths          = result.depths,
+        info            = {**result.info, "data_fraction": data_fraction},
     )
-    return (
-        new_result,
-        coords_np[keep],
-        targets_np[keep],
-        targets_phys[keep],
-    )
 
-
-# ── Compact result (drop unassigned observations) ─────────────────────────────
 
 def _compact_result(result: SplitResult) -> SplitResult:
     """Return a SplitResult keeping only observations assigned to at least one split.
@@ -352,6 +357,11 @@ def train(
                     v_T   += per["CT"].item() * n
                     v_S   += per["SA"].item() * n
                     n_va  += n
+            if n_va == 0:
+                raise RuntimeError(
+                    "Validation loader produced zero batches — val set is empty. "
+                    "This should have been caught at split time; please report this as a bug."
+                )
             v_tot /= n_va;  v_T /= n_va;  v_S /= n_va
         else:
             v_tot = history["val"][-1]  if history["val"]  else float("inf")
@@ -362,6 +372,19 @@ def train(
         history["lr"].append(scheduler.get_last_lr()[0])
         history["train"].append(ep_tot); history["train_T"].append(ep_T); history["train_S"].append(ep_S)
         history["val"].append(v_tot);   history["val_T"].append(v_T);   history["val_S"].append(v_S)
+
+        if _MLFLOW and mlflow.active_run():
+            mf_metrics = {
+                "train/loss": ep_tot,
+                "train/T_loss": ep_T,
+                "train/S_loss": ep_S,
+                "lr": scheduler.get_last_lr()[0],
+            }
+            if do_val:
+                mf_metrics["val/loss"]   = v_tot
+                mf_metrics["val/T_loss"] = v_T
+                mf_metrics["val/S_loss"] = v_S
+            mlflow.log_metrics(mf_metrics, step=epoch)
 
         if do_val and v_tot < best_val - args.min_delta:
             best_val     = v_tot
@@ -683,10 +706,8 @@ def _save_run_info(
         ("Train fraction",   f"{args.train_fraction}"),
         ("Val fraction",     f"{args.val_fraction}"),
         ("Seed",             str(args.seed)),
-        ("Data fraction",    str(args.data_fraction)
-                             if getattr(args, "data_fraction", None) is not None else "—"),
-        ("Depth fraction",   str(args.depth_fraction)
-                             if getattr(args, "depth_fraction", None) is not None else "—"),
+        ("Train depths frac.", str(args.train_depths_data_fraction)
+                              if getattr(args, "train_depths_data_fraction", None) is not None else "—"),
         ("Weekly subsample", str(getattr(args, "weekly_subsample", False))),
         ("Epochs",           f"{args.epochs:,}"),
         ("Batch size",       f"{args.batch_size:,}"),
@@ -729,10 +750,8 @@ def _save_run_info(
     if extra_split_kwargs and "n_test_squares" in extra_split_kwargs:
         parts.append(_f("n-test-squares", extra_split_kwargs["n_test_squares"]))
     parts.append(_f("seed", args.seed))
-    if getattr(args, "data_fraction", None) is not None:
-        parts.append(_f("data-fraction", args.data_fraction))
-    if getattr(args, "depth_fraction", None) is not None:
-        parts.append(_f("depth-fraction", args.depth_fraction))
+    if getattr(args, "train_depths_data_fraction", None) is not None:
+        parts.append(_f("train-depths-data-fraction", args.train_depths_data_fraction))
     if getattr(args, "weekly_subsample", False):
         parts.append("    --weekly-subsample")
     parts += [
@@ -769,6 +788,7 @@ def run_experiment(
     val_mode_label: str,
     args,
     extra_split_kwargs: dict | None = None,
+    run_suffix: str = "",
 ) -> None:
     """Full experiment pipeline. Called by each experiment's main()."""
     cfg    = yaml.safe_load(open(args.config))
@@ -779,13 +799,45 @@ def run_experiment(
     np.random.seed(args.seed)
 
     run_stamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = args.output_dir / run_stamp
+    folder     = f"{run_stamp}_{run_suffix}" if run_suffix else run_stamp
+    output_dir = args.output_dir / folder
     plots_dir  = output_dir / "plots"
     ckpt_dir   = output_dir / "checkpoints"
     for d in (output_dir, plots_dir, ckpt_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     _save_run_info(exp_name, val_mode, args, output_dir, extra_split_kwargs)
+
+    if _MLFLOW:
+        mlflow.set_experiment(exp_name)
+        _mf_run = mlflow.start_run(run_name=run_stamp)
+        _mf_params = {
+            "val_mode":            val_mode,
+            "train_fraction":      args.train_fraction,
+            "val_fraction":        args.val_fraction,
+            "seed":                args.seed,
+            "train_depths_data_fraction": getattr(args, "train_depths_data_fraction", None),
+            "epochs":              args.epochs,
+            "batch_size":          args.batch_size,
+            "infer_batch":         args.infer_batch,
+            "patience":            args.patience,
+            "val_every":           getattr(args, "val_every", 1),
+            "checkpoint_every":    args.checkpoint_every,
+            "amp":                 getattr(args, "amp", False),
+            "num_workers":         getattr(args, "num_workers", 0),
+            "weekly_subsample":    getattr(args, "weekly_subsample", False),
+        }
+        if extra_split_kwargs:
+            _mf_params.update(extra_split_kwargs)
+        if getattr(args, "lr", None):
+            _mf_params["lr"] = args.lr
+        _model_cfg = cfg.get("model", {})
+        _mf_params.update({f"model/{k}": v for k, v in _model_cfg.items()})
+        mlflow.log_params({k: v for k, v in _mf_params.items() if v is not None})
+        mlflow.set_tags({"output_dir": str(output_dir), "config": str(args.config)})
+        print(f"  MLflow run: {_mf_run.info.run_id}")
+    else:
+        _mf_run = None
 
     log_path     = output_dir / "train.log"
     _log_file    = open(log_path, "w", buffering=1, encoding="utf-8")
@@ -816,12 +868,33 @@ def run_experiment(
         val_fraction=args.val_fraction,
         seed=args.seed,
         weekly_subsample=getattr(args, "weekly_subsample", False),
-        data_fraction=getattr(args, "data_fraction", None),
         **(extra_split_kwargs or {}),
     )
     result = splitter.split(**split_kw)
     splitter.print_summary(result)
     result = _compact_result(result)
+
+    def _check_split(r: "SplitResult", stage: str = "") -> None:
+        label = f" after {stage}" if stage else ""
+        n_val  = int(r.val_mask.sum())
+        n_test = int(r.test_mask.sum())
+        if n_val == 0:
+            raise RuntimeError(
+                f"Validation set is empty{label}. The val squares contain no valid profiles. "
+                "Try a larger --val-fraction, more --n-val-squares, or a different --seed."
+            )
+        if n_test == 0:
+            raise RuntimeError(
+                f"Test set is empty{label}. The test squares contain no valid profiles. "
+                "Try a larger val/test split or a different --seed."
+            )
+
+    _check_split(result)
+
+    data_fraction = getattr(args, "train_depths_data_fraction", None)
+    if data_fraction is not None:
+        result = _subsample_train_depths(result, data_fraction, args.seed)
+        result = _compact_result(result)
 
     print("Saving split map …", flush=True)
     split_png = save_split_map_png(result, ds, plots_dir)
@@ -833,16 +906,6 @@ def run_experiment(
         result, ds, args.var_temp, args.var_sal, bounds,
     )
     print(f"  Done ({time.time()-t0:.1f}s)  coords={coords_np.shape}")
-
-    depth_fraction = getattr(args, "depth_fraction", None)
-    if depth_fraction is not None:
-        result, coords_np, targets_np, targets_phys = _subsample_depths(
-            result, coords_np, targets_np, targets_phys, depth_fraction, args.seed,
-        )
-        n_surf = int((result.i_dep == 0).sum())
-        n_deep = int((result.i_dep > 0).sum())
-        print(f"  Depth subsample ({depth_fraction:.0%}): "
-              f"{n_surf:,} surface + {n_deep:,} deep = {len(coords_np):,} total obs")
 
     num_workers = getattr(args, "num_workers", 0)
     use_amp     = getattr(args, "amp", False) and device.type == "cuda"
@@ -886,9 +949,25 @@ def run_experiment(
           f"best val {history['best_val_loss']:.6f}")
 
     torch.save(
-        {"model_state": best_state, "epoch": best_epoch,
-         "val_loss": history["best_val_loss"], "cfg": cfg,
-         "split_info": result.info},
+        {"model_state":   best_state,
+         "epoch":         best_epoch,
+         "val_loss":      history["best_val_loss"],
+         "cfg":           cfg,
+         "split_info":    result.info,
+         "history":       history,
+         "training_args": {
+             "exp_name":       exp_name,
+             "val_mode":       val_mode,
+             "val_mode_label": val_mode_label,
+             "lr":             args.lr or cfg["training"]["learning_rate"],
+             "batch_size":     args.batch_size,
+             "epochs":         args.epochs,
+             "patience":       args.patience,
+             "n_params":       n_params,
+             "config_name":    args.config.name,
+             "zarr_name":      args.zarr_path.name,
+             "train_depths_data_fraction": getattr(args, "train_depths_data_fraction", None),
+         }},
         output_dir / "best_model.pt",
     )
 
@@ -935,7 +1014,9 @@ def run_experiment(
         pdf_evaluation("Test",       test_m, depths_g, args.label_temp, args.label_sal),
         pdf_summary(val_m, test_m, args.label_temp, args.label_sal, history, n_params),
     ]
-    pdf_path = build_pdf(pages, output_dir, title=f"{exp_name} — INR")
+    pdf_path = build_pdf(pages, output_dir,
+                         title=f"{exp_name} — INR",
+                         filename=f"{run_stamp}_report")
     print(f"PDF → {pdf_path}")
 
     print()
@@ -949,6 +1030,31 @@ def run_experiment(
     print(f"  Best epoch  : {best_epoch}")
     print(f"  Training    : {elapsed/60:.1f} min")
     print("─" * 60)
+
+    if _MLFLOW and _mf_run is not None:
+        mlflow.log_metrics({
+            "final/val_T_rmse":  val_m["T_rmse"],
+            "final/val_S_rmse":  val_m["S_rmse"],
+            "final/test_T_rmse": test_m["T_rmse"],
+            "final/test_S_rmse": test_m["S_rmse"],
+            "final/best_epoch":  best_epoch,
+            "final/train_min":   elapsed / 60,
+            "final/n_params":    n_params,
+            "final/n_train_obs": int(result.train_mask.sum()),
+            "final/n_val_obs":   int(result.val_mask.sum()),
+            "final/n_test_obs":  int(result.test_mask.sum()),
+        })
+        for path in [
+            output_dir / "run_info.txt",
+            output_dir / "results.json",
+            output_dir / "best_model.pt",
+            plots_dir  / "split_map.png",
+            pdf_path,
+        ]:
+            if path.exists():
+                mlflow.log_artifact(str(path))
+        mlflow.end_run()
+        print(f"MLflow run ended: {_mf_run.info.run_id}")
 
     sys.stdout = _orig_stdout
     sys.stderr = _orig_stderr

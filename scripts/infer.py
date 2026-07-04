@@ -39,7 +39,7 @@ from inrpinn.experiments.runner import (
 )
 from inrpinn.experiments.plotting import (
     build_pdf,
-    pdf_spatial_fields, pdf_temporal_profiles,
+    pdf_cover, pdf_spatial_fields, pdf_temporal_profiles,
     pdf_split_map, pdf_training, pdf_evaluation, pdf_summary,
 )
 
@@ -61,10 +61,11 @@ def parse_args() -> argparse.Namespace:
 
     # Split parameters (must match the original training run)
     p.add_argument("--val-mode",        type=str,   default="uniform",
-                   choices=["uniform", "contiguous"])
+                   choices=["uniform", "contiguous", "disjoint_squares"])
     p.add_argument("--train-fraction",  type=float, default=0.70)
     p.add_argument("--val-fraction",    type=float, default=0.15)
     p.add_argument("--n-val-squares",   type=int,   default=5)
+    p.add_argument("--n-test-squares",  type=int,   default=3)
     p.add_argument("--seed",            type=int,   default=42)
     p.add_argument("--weekly-subsample", action="store_true", default=False)
     p.add_argument("--data-fraction",   type=float, default=None)
@@ -122,6 +123,9 @@ def main() -> None:
     )
     if args.val_mode == "contiguous":
         split_kw["n_val_squares"] = args.n_val_squares
+    if args.val_mode == "disjoint_squares":
+        split_kw["n_val_squares"]  = args.n_val_squares
+        split_kw["n_test_squares"] = args.n_test_squares
 
     result = splitter.split(**split_kw)
     splitter.print_summary(result)
@@ -161,6 +165,7 @@ def main() -> None:
 
     # ── Report ────────────────────────────────────────────────────────────────
     if not args.no_pdf:
+        import types
         out_dir  = ckpt_path.parent
         epoch    = ckpt.get("epoch", 0)
         history  = ckpt.get("history")
@@ -172,8 +177,34 @@ def main() -> None:
         summary_history = history or {"best_epoch": epoch,
                                       "best_val_loss": ckpt.get("val_loss", float("nan"))}
 
+        # ── Cover: reconstruct from checkpoint's saved training_args ──────────
+        ta       = ckpt.get("training_args", {})
+        exp_name = ta.get("exp_name", "INR Experiment")
+        pdf_title = f"{exp_name} — INR"
+
+        cover_args = types.SimpleNamespace(
+            lr          = ta.get("lr"),
+            batch_size  = ta.get("batch_size", 0),
+            epochs      = ta.get("epochs", epoch),
+            patience    = ta.get("patience", "—"),
+            seed        = result.info.get("seed", args.seed),
+            config      = types.SimpleNamespace(name=ta.get("config_name", args.config.name)),
+            zarr_path   = types.SimpleNamespace(name=ta.get("zarr_name",   args.zarr_path.name)),
+        )
+
         print("\nBuilding PDF …", flush=True)
         pages = [
+            pdf_cover(
+                exp_name        = exp_name,
+                val_mode_label  = ta.get("val_mode_label", args.val_mode),
+                args            = cover_args,
+                cfg             = cfg,
+                n_params        = ta.get("n_params", model.n_parameters()),
+                result          = result,
+                history         = summary_history,
+                val_metrics     = val_m,
+                test_metrics    = test_m,
+            ),
             pdf_spatial_fields(ds, args.var_temp, args.var_sal,
                                args.label_temp, args.label_sal),
             pdf_temporal_profiles(ds, result, depths_g,
@@ -191,8 +222,8 @@ def main() -> None:
             pdf_summary(val_m, test_m, args.label_temp, args.label_sal,
                         summary_history, model.n_parameters()),
         ]
-        pdf_path = build_pdf(pages, out_dir,
-                             title=f"Inference — epoch {epoch}")
+        pdf_path = build_pdf(pages, out_dir, title=pdf_title,
+                             filename=f"{out_dir.name}_report")
         print(f"PDF → {pdf_path}")
 
     print()

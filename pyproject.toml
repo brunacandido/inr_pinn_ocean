@@ -8,6 +8,7 @@ dependencies = [
     "argparse>=1.4.0",
     "datetime>=6.0",
     "matplotlib>=3.11.0",
+    "mlflow>=1.27.0",
     "pandas>=3.0.3",
     "pathlib>=1.0.1",
     "torch>=2.12.1",
