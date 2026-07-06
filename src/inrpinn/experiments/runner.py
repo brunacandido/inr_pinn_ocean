@@ -18,12 +18,15 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
-try:
-    import mlflow
-    import mlflow.pytorch
-    _MLFLOW = True
-except ImportError:
-    _MLFLOW = False
+import os as _os
+_MLFLOW = False
+if not _os.environ.get("NO_MLFLOW"):
+    try:
+        import mlflow
+        import mlflow.pytorch
+        _MLFLOW = True
+    except ImportError:
+        pass
 
 import numpy as np
 import torch
@@ -278,7 +281,9 @@ def train(
     _loc = "GPU" if train_loader._on_gpu else "CPU (pinned)"
     print(f"  Training data on {_loc}  |  {len(train_loader)} batches/epoch")
 
-    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+    _use_fused = device.type == "cuda"
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr,
+                                 fused=_use_fused)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimiser, T_max=args.epochs, eta_min=lr * 1e-2,
     )
@@ -319,10 +324,15 @@ def train(
 
     pbar = trange(start_epoch, args.epochs + 1, desc="Training", unit="ep", dynamic_ncols=True)
 
+    # Pre-allocated accumulators — in-place ops avoid new tensor creation every batch
+    _tr_acc  = torch.zeros(3, device=device)  # [total, CT, SA]
+    _val_acc = torch.zeros(3, device=device)
+
     for epoch in pbar:
         # ── train ──────────────────────────────────────────────────────────────
         model.train()
-        ep_tot = ep_T = ep_S = n_tr = 0
+        _tr_acc.zero_()
+        n_tr = 0
         for xb, yb in train_loader:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
@@ -333,19 +343,22 @@ def train(
             scaler.step(optimiser)
             scaler.update()
             n = xb.shape[0]
-            ep_tot += loss.detach().item() * n
-            ep_T   += per["CT"].detach().item() * n
-            ep_S   += per["SA"].detach().item() * n
-            n_tr   += n
+            # in-place accumulation — no new tensors, no per-batch GPU sync
+            _tr_acc[0].add_(loss.detach(),       alpha=n)
+            _tr_acc[1].add_(per["CT"].detach(),  alpha=n)
+            _tr_acc[2].add_(per["SA"].detach(),  alpha=n)
+            n_tr += n
 
-        ep_tot /= n_tr;  ep_T /= n_tr;  ep_S /= n_tr
+        # single GPU→CPU transfer for all three scalars
+        ep_tot, ep_T, ep_S = (_tr_acc / n_tr).tolist()
         scheduler.step()
 
         # ── validate (skipped on non-val epochs) ──────────────────────────────
         do_val = (epoch % val_every == 0) or (epoch == args.epochs)
         if do_val:
             model.eval()
-            v_tot = v_T = v_S = n_va = 0
+            _val_acc.zero_()
+            n_va = 0
             with torch.inference_mode():
                 for xb, yb in val_loader:
                     xb = xb.to(device, non_blocking=True)
@@ -353,16 +366,17 @@ def train(
                     with torch.autocast(device_type=device.type, enabled=use_amp):
                         _, per = model.loss(xb, yb)
                     n = xb.shape[0]
-                    v_tot += (per["CT"].item() + per["SA"].item()) * n
-                    v_T   += per["CT"].item() * n
-                    v_S   += per["SA"].item() * n
-                    n_va  += n
+                    _val_acc[0].add_(per["CT"] + per["SA"], alpha=n)
+                    _val_acc[1].add_(per["CT"],              alpha=n)
+                    _val_acc[2].add_(per["SA"],              alpha=n)
+                    n_va += n
             if n_va == 0:
                 raise RuntimeError(
                     "Validation loader produced zero batches — val set is empty. "
                     "This should have been caught at split time; please report this as a bug."
                 )
-            v_tot /= n_va;  v_T /= n_va;  v_S /= n_va
+            # single transfer for all three val scalars
+            v_tot, v_T, v_S = (_val_acc / n_va).tolist()
         else:
             v_tot = history["val"][-1]  if history["val"]  else float("inf")
             v_T   = history["val_T"][-1] if history["val_T"] else float("inf")
@@ -782,6 +796,44 @@ def _save_run_info(
 
 # ── Shared main pipeline ──────────────────────────────────────────────────────
 
+def _check_paths(args) -> None:
+    """Fail fast with a clear message if any required input path is missing."""
+    errors = []
+
+    config = Path(args.config)
+    if not config.exists():
+        errors.append(f"Config file not found      : {config}")
+    elif config.suffix not in (".yaml", ".yml"):
+        errors.append(f"Config must be a YAML file : {config}")
+
+    zarr = Path(args.zarr_path)
+    if not zarr.exists():
+        errors.append(f"Zarr dataset not found     : {zarr}")
+    elif not zarr.is_dir():
+        errors.append(f"Zarr path must be a dir    : {zarr}")
+
+    resume = getattr(args, "resume", None)
+    if resume is not None:
+        resume = Path(resume)
+        if not resume.exists():
+            errors.append(f"Resume checkpoint not found: {resume}")
+        elif resume.suffix != ".pt":
+            errors.append(f"Resume must be a .pt file  : {resume}  (got {resume.suffix!r})")
+        else:
+            with open(resume, "rb") as fh:
+                magic = fh.read(2)
+            # PyTorch saves as ZIP (b"PK") since v1.6, or legacy pickle (b"\x80")
+            if magic[:1] not in (b"\x80",) and magic != b"PK":
+                errors.append(
+                    f"Resume file is not a PyTorch checkpoint: {resume}\n"
+                    f"  First bytes: {magic!r}  — is this a PDF or log file?"
+                )
+
+    if errors:
+        lines = "\n".join(f"  ✗ {e}" for e in errors)
+        raise SystemExit(f"\nPath validation failed — fix these before training:\n{lines}\n")
+
+
 def run_experiment(
     exp_name: str,
     val_mode: str,
@@ -791,6 +843,7 @@ def run_experiment(
     run_suffix: str = "",
 ) -> None:
     """Full experiment pipeline. Called by each experiment's main()."""
+    _check_paths(args)
     cfg    = yaml.safe_load(open(args.config))
     device = get_device(args.device)
     bounds = cfg["normalisation"]
@@ -954,6 +1007,14 @@ def run_experiment(
          "val_loss":      history["best_val_loss"],
          "cfg":           cfg,
          "split_info":    result.info,
+         "split_kwargs":  {
+             "mode":             val_mode,
+             "train_fraction":   args.train_fraction,
+             "val_fraction":     args.val_fraction,
+             "seed":             args.seed,
+             "weekly_subsample": getattr(args, "weekly_subsample", False),
+             **(extra_split_kwargs or {}),
+         },
          "history":       history,
          "training_args": {
              "exp_name":       exp_name,

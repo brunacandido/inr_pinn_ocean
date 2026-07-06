@@ -18,6 +18,8 @@
 
 set -euo pipefail
 
+export NO_MLFLOW=1   # disable MLflow on cluster (no mlflow CLI needed)
+
 # ── Common flags (identical across all runs) ──────────────────────────────────
 # Val and test always use the full dataset — do NOT pass --train-depths-data-fraction here.
 BASE_ARGS=(

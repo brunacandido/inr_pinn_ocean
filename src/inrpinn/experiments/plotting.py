@@ -1258,6 +1258,150 @@ def _add_page_chrome(fig: plt.Figure, running_title: str, page_num: int, total_p
               color=CHROME_COLOR, ha="right", va="bottom", transform=fig.transFigure)
 
 
+def pdf_pinn_training(history: dict, inr_best_val: float | None = None) -> plt.Figure:
+    """Training curves for PINN fine-tuning: data loss, physics loss, and LR shown separately."""
+    ep      = history["epoch"]
+    best_ep = history.get("best_epoch", ep[-1] if ep else 0)
+
+    fig, axes = plt.subplots(4, 1, figsize=A4_P, sharex=True)
+    _suptitle(fig, "PINN Fine-tuning History")
+
+    # Panel 1: total PINN loss (data + weighted physics)
+    _draw_loss_curve(axes[0], ep, history["total"], history["val"],
+                     "Total PINN Loss (data + EOS)", best_ep)
+    if inr_best_val is not None:
+        axes[0].axhline(inr_best_val, color="#888", ls="-.", lw=1,
+                        label=f"INR baseline ({inr_best_val:.5f})")
+        axes[0].legend(loc="upper right", fontsize=7)
+
+    # Panel 2: data loss only (CT + SA MSE, no physics term)
+    _draw_loss_curve(axes[1], ep, history["data"], history["val"],
+                     "Data Loss Only (CT + SA MSE)", best_ep)
+    if inr_best_val is not None:
+        axes[1].axhline(inr_best_val, color="#888", ls="-.", lw=1)
+
+    # Panel 3: EOS physics residual
+    eos_vals = history.get("eos", [])
+    if eos_vals:
+        axes[2].semilogy(ep, eos_vals, lw=1.4, color="#8e44ad", label="EOS residual")
+        axes[2].axvline(best_ep, color="#555", ls=":", lw=1, label=f"Best ({best_ep})")
+        axes[2].set_ylabel("EOS Residual (log)")
+        axes[2].set_title("TEOS-10 EOS Physics Residual")
+        axes[2].legend(loc="upper right", fontsize=7)
+        axes[2].grid(True, alpha=0.35)
+
+    # Panel 4: learning rate
+    _draw_lr_curve(axes[3], ep, history["lr"])
+
+    axes[-1].set_xlabel("PINN Epoch")
+    for ax in axes[:-1]:
+        ax.tick_params(labelbottom=False)
+
+    fig.tight_layout(rect=[0.02, CONTENT_BOTTOM, 0.98, CONTENT_TOP - 0.02], h_pad=0.6)
+    _tag(fig, "PINN TRAINING")
+    return fig
+
+
+def pdf_pinn_comparison(
+    inr_val_m:  dict, inr_test_m:  dict,
+    pinn_val_m: dict, pinn_test_m: dict,
+    label_T: str, label_S: str,
+    depths_g: np.ndarray,
+) -> plt.Figure:
+    """Comparison page: INR baseline vs PINN fine-tuned metrics."""
+    fig = plt.figure(figsize=A4_P)
+    _suptitle(fig, "INR vs PINN — Metrics Comparison")
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    col_headers = ["Metric", "INR Val", "PINN Val", "Δ Val", "INR Test", "PINN Test", "Δ Test"]
+    rows = [
+        ("T RMSE (°C)",
+         f"{inr_val_m['T_rmse']:.4f}", f"{pinn_val_m['T_rmse']:.4f}",
+         f"{pinn_val_m['T_rmse'] - inr_val_m['T_rmse']:+.4f}",
+         f"{inr_test_m['T_rmse']:.4f}", f"{pinn_test_m['T_rmse']:.4f}",
+         f"{pinn_test_m['T_rmse'] - inr_test_m['T_rmse']:+.4f}"),
+        ("T MAE (°C)",
+         f"{inr_val_m['T_mae']:.4f}", f"{pinn_val_m['T_mae']:.4f}",
+         f"{pinn_val_m['T_mae'] - inr_val_m['T_mae']:+.4f}",
+         f"{inr_test_m['T_mae']:.4f}", f"{pinn_test_m['T_mae']:.4f}",
+         f"{pinn_test_m['T_mae'] - inr_test_m['T_mae']:+.4f}"),
+        ("S RMSE (PSU)",
+         f"{inr_val_m['S_rmse']:.5f}", f"{pinn_val_m['S_rmse']:.5f}",
+         f"{pinn_val_m['S_rmse'] - inr_val_m['S_rmse']:+.5f}",
+         f"{inr_test_m['S_rmse']:.5f}", f"{pinn_test_m['S_rmse']:.5f}",
+         f"{pinn_test_m['S_rmse'] - inr_test_m['S_rmse']:+.5f}"),
+        ("S MAE (PSU)",
+         f"{inr_val_m['S_mae']:.5f}", f"{pinn_val_m['S_mae']:.5f}",
+         f"{pinn_val_m['S_mae'] - inr_val_m['S_mae']:+.5f}",
+         f"{inr_test_m['S_mae']:.5f}", f"{pinn_test_m['S_mae']:.5f}",
+         f"{pinn_test_m['S_mae'] - inr_test_m['S_mae']:+.5f}"),
+    ]
+
+    ax_tbl = fig.add_axes([0.03, 0.68, 0.94, 0.22])
+    ax_tbl.axis("off")
+    tbl = ax_tbl.table(
+        cellText=[list(r) for r in rows],
+        colLabels=col_headers,
+        cellLoc="center", loc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.scale(1.0, 1.6)
+    for (row, col), cell in tbl.get_celld().items():
+        if row == 0:
+            cell.set_facecolor("#2c3e50")
+            cell.set_text_props(color="white", fontweight="bold")
+        elif col == 3 or col == 6:   # Δ columns
+            val = rows[row - 1][col] if row > 0 else ""
+            cell.set_facecolor("#d5f0d5" if val.startswith("-") else
+                               "#f0d5d5" if val.startswith("+") else "#f8f8f8")
+        else:
+            cell.set_facecolor("#f8f9fa" if row % 2 else "#ffffff")
+
+    # ── RMSE-depth profiles ───────────────────────────────────────────────────
+    ax_T = fig.add_axes([0.07, 0.37, 0.40, 0.25])
+    ax_S = fig.add_axes([0.55, 0.37, 0.40, 0.25])
+
+    inr_T_rd  = np.array(inr_val_m["T_rmse_depth"])
+    pinn_T_rd = np.array(pinn_val_m["T_rmse_depth"])
+    inr_S_rd  = np.array(inr_val_m["S_rmse_depth"])
+    pinn_S_rd = np.array(pinn_val_m["S_rmse_depth"])
+
+    for ax, inr_d, pinn_d, label, unit, color in [
+        (ax_T, inr_T_rd, pinn_T_rd, label_T, "°C",  COL_T),
+        (ax_S, inr_S_rd, pinn_S_rd, label_S, "PSU", COL_S),
+    ]:
+        ax.plot(inr_d,  depths_g, "o--", color=color,  ms=2, lw=1.2, alpha=0.7, label="INR")
+        ax.plot(pinn_d, depths_g, "s-",  color="#8e44ad", ms=2, lw=1.4, label="PINN")
+        ax.invert_yaxis()
+        ax.set_xlabel(f"RMSE ({unit})")
+        ax.set_ylabel("Depth (m)")
+        ax.set_title(f"{label} RMSE by Depth (Val)")
+        ax.legend(loc="lower right", fontsize=7)
+        ax.grid(True, alpha=0.35)
+
+    # ── Bar chart: key metrics ────────────────────────────────────────────────
+    ax_bar = fig.add_axes([0.07, CONTENT_BOTTOM + 0.02, 0.86, 0.20])
+    metrics_labels = ["Val T RMSE", "Val S RMSE×10", "Test T RMSE", "Test S RMSE×10"]
+    inr_vals  = [inr_val_m["T_rmse"],  inr_val_m["S_rmse"]  * 10,
+                 inr_test_m["T_rmse"], inr_test_m["S_rmse"] * 10]
+    pinn_vals = [pinn_val_m["T_rmse"], pinn_val_m["S_rmse"] * 10,
+                 pinn_test_m["T_rmse"], pinn_test_m["S_rmse"] * 10]
+    x = np.arange(len(metrics_labels))
+    w = 0.35
+    ax_bar.bar(x - w/2, inr_vals,  w, color=COL_TR, alpha=0.8, label="INR")
+    ax_bar.bar(x + w/2, pinn_vals, w, color="#8e44ad", alpha=0.8, label="PINN")
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(metrics_labels, fontsize=8)
+    ax_bar.set_ylabel("RMSE")
+    ax_bar.set_title("Validation & Test RMSE Comparison (S RMSE ×10 for scale)")
+    ax_bar.legend(loc="upper right", fontsize=8)
+    ax_bar.grid(axis="y", alpha=0.35)
+
+    _tag(fig, "INR vs PINN COMPARISON")
+    return fig
+
+
 def build_pdf(pages: list[plt.Figure], output_dir: Path, title: str,
               filename: str = "report") -> Path:
     """Assemble page figures into a single true-A4 PDF report.
